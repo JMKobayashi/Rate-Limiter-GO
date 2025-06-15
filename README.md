@@ -106,7 +106,7 @@ O projeto inclui um teste de carga que pode ser usado para verificar o comportam
 
 1. Certifique-se de que o servidor está rodando:
 ```bash
-docker-compose up -d
+docker compose up --build -d
 ```
 
 2. Execute o teste de carga:
