@@ -2,175 +2,519 @@ package usecase
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/JMKobayashi/Rate-Limiter-GO/internal/entity"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-type MockRepository struct {
-	limiters map[string]*entity.RateLimiter
+// MockRateLimiterRepository é uma implementação mock do RateLimiterRepository
+// para ser usada em testes unitários.
+type MockRateLimiterRepository struct {
+	mu       sync.Mutex                     // Mutex para garantir concorrência segura ao acessar o mapa
+	limiters map[string]*entity.RateLimiter // Um mapa em memória para simular o armazenamento
+	err      error                          // Um erro opcional para simular falhas no repositório
 }
 
-func NewMockRepository() *MockRepository {
-	return &MockRepository{
+// NewMockRateLimiterRepository cria uma nova instância do mock do repositório.
+func NewMockRateLimiterRepository() *MockRateLimiterRepository {
+	return &MockRateLimiterRepository{
 		limiters: make(map[string]*entity.RateLimiter),
 	}
 }
 
-func (m *MockRepository) Save(ctx context.Context, limiter *entity.RateLimiter) error {
-	key := limiter.IP
+// Get simula a obtenção de um RateLimiter do "armazenamento".
+// Se um erro for configurado no mock, ele será retornado.
+func (m *MockRateLimiterRepository) Get(ctx context.Context, key string) (*entity.RateLimiter, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.err != nil {
+		return nil, m.err
+	}
+	if limiter, exists := m.limiters[key]; exists {
+		// Verifica se o bloqueio expirou
+		if limiter.Blocked && !limiter.BlockedUntil.IsZero() && time.Now().After(limiter.BlockedUntil) {
+			limiter.Blocked = false
+			limiter.BlockedUntil = time.Time{}
+			limiter.Requests = 0
+			m.limiters[key] = limiter
+		}
+		return limiter, nil
+	}
+	return nil, nil
+}
+
+// Save simula o salvamento de um RateLimiter no "armazenamento".
+// Se um erro for configurado no mock, ele será retornado.
+func (m *MockRateLimiterRepository) Save(ctx context.Context, limiter *entity.RateLimiter) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.err != nil {
+		return m.err
+	}
+	key := "rate_limit:" + limiter.IP
 	if limiter.Token != "" {
-		key = limiter.Token
+		key = "rate_limit:" + limiter.Token
 	}
 	m.limiters[key] = limiter
 	return nil
 }
 
-func (m *MockRepository) Get(ctx context.Context, key string) (*entity.RateLimiter, error) {
-	return m.limiters[key], nil
-}
+// Delete simula a remoção de um RateLimiter do "armazenamento".
+func (m *MockRateLimiterRepository) Delete(ctx context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-func (m *MockRepository) Delete(ctx context.Context, key string) error {
 	delete(m.limiters, key)
 	return nil
 }
 
+// SetError permite configurar um erro para ser retornado pelas operações do mock.
+func (m *MockRateLimiterRepository) SetError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.err = err
+}
+
+// TestRateLimiterUseCase_IsAllowed testa o método IsAllowed do RateLimiterUseCase.
 func TestRateLimiterUseCase_IsAllowed(t *testing.T) {
 	tests := []struct {
 		name           string
 		identifier     string
 		isToken        bool
-		rateLimitIP    int
-		rateLimitToken int
-		requests       int64
+		initialLimiter *entity.RateLimiter
 		expected       bool
+		config         struct {
+			rateLimitIP        int
+			rateLimitToken     int
+			blockDurationIP    int
+			blockDurationToken int
+			enableIPLimiter    bool
+			enableTokenLimiter bool
+		}
 	}{
 		{
-			name:           "IP within limit",
-			identifier:     "192.168.1.1",
-			isToken:        false,
-			rateLimitIP:    10,
-			rateLimitToken: 100,
-			requests:       5,
-			expected:       true,
+			name:       "IP dentro do limite",
+			identifier: "192.168.1.1",
+			isToken:    false,
+			initialLimiter: &entity.RateLimiter{
+				IP:           "192.168.1.1",
+				Requests:     5,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: true,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    true,
+				enableTokenLimiter: true,
+			},
 		},
 		{
-			name:           "IP exceeding limit",
-			identifier:     "192.168.1.1",
-			isToken:        false,
-			rateLimitIP:    10,
-			rateLimitToken: 100,
-			requests:       11,
-			expected:       false,
+			name:       "IP excede limite",
+			identifier: "192.168.1.1",
+			isToken:    false,
+			initialLimiter: &entity.RateLimiter{
+				IP:           "192.168.1.1",
+				Requests:     10,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: false,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    true,
+				enableTokenLimiter: true,
+			},
 		},
 		{
-			name:           "Token within limit",
-			identifier:     "test-token",
-			isToken:        true,
-			rateLimitIP:    10,
-			rateLimitToken: 100,
-			requests:       50,
-			expected:       true,
+			name:       "Token dentro do limite",
+			identifier: "test-token",
+			isToken:    true,
+			initialLimiter: &entity.RateLimiter{
+				Token:        "test-token",
+				Requests:     50,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: true,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    true,
+				enableTokenLimiter: true,
+			},
 		},
 		{
-			name:           "Token exceeding limit",
-			identifier:     "test-token",
-			isToken:        true,
-			rateLimitIP:    10,
-			rateLimitToken: 100,
-			requests:       101,
-			expected:       false,
+			name:       "Token excede limite",
+			identifier: "test-token",
+			isToken:    true,
+			initialLimiter: &entity.RateLimiter{
+				Token:        "test-token",
+				Requests:     100,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: false,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    true,
+				enableTokenLimiter: true,
+			},
+		},
+		{
+			name:       "IP limiter desabilitado",
+			identifier: "192.168.1.1",
+			isToken:    false,
+			initialLimiter: &entity.RateLimiter{
+				IP:           "192.168.1.1",
+				Requests:     100,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: true,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    false,
+				enableTokenLimiter: true,
+			},
+		},
+		{
+			name:       "Token limiter desabilitado",
+			identifier: "test-token",
+			isToken:    true,
+			initialLimiter: &entity.RateLimiter{
+				Token:        "test-token",
+				Requests:     1000,
+				LastRequest:  time.Now(),
+				Blocked:      false,
+				BlockedUntil: time.Time{},
+			},
+			expected: true,
+			config: struct {
+				rateLimitIP        int
+				rateLimitToken     int
+				blockDurationIP    int
+				blockDurationToken int
+				enableIPLimiter    bool
+				enableTokenLimiter bool
+			}{
+				rateLimitIP:        10,
+				rateLimitToken:     100,
+				blockDurationIP:    300,
+				blockDurationToken: 600,
+				enableIPLimiter:    true,
+				enableTokenLimiter: false,
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			repo := NewMockRepository()
-			useCase := NewRateLimiterUseCase(repo, tt.rateLimitIP, tt.rateLimitToken, 300)
+			repo := NewMockRateLimiterRepository()
+			useCase := NewRateLimiterUseCase(
+				repo,
+				tt.config.rateLimitIP,
+				tt.config.rateLimitToken,
+				tt.config.blockDurationIP,
+				tt.config.blockDurationToken,
+				tt.config.enableIPLimiter,
+				tt.config.enableTokenLimiter,
+			)
 
-			// Setup initial state
-			limiter := entity.NewRateLimiter(tt.identifier, "")
+			if tt.initialLimiter != nil {
+				err := repo.Save(context.Background(), tt.initialLimiter)
+				require.NoError(t, err)
+			}
+
+			allowed, err := useCase.IsAllowed(context.Background(), tt.identifier, tt.isToken)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, allowed)
+		})
+	}
+}
+
+// TestRateLimiterUseCase_IsAllowed_RepositoryError testa o tratamento de erro do repositório.
+func TestRateLimiterUseCase_IsAllowed_RepositoryError(t *testing.T) {
+	repo := NewMockRateLimiterRepository()
+	useCase := NewRateLimiterUseCase(repo, 10, 100, 300, 300, true, true)
+
+	// Test Get error
+	repo.err = errors.New("erro simulado do repositório")
+	allowed, err := useCase.IsAllowed(context.Background(), "test_id", false)
+	assert.Error(t, err)
+	assert.False(t, allowed)
+	assert.Contains(t, err.Error(), "erro simulado do repositório")
+
+	// Test Save error
+	repo.err = errors.New("erro simulado ao salvar")
+	allowed, err = useCase.IsAllowed(context.Background(), "block_id", false)
+	assert.Error(t, err)
+	assert.False(t, allowed)
+	assert.Contains(t, err.Error(), "erro simulado ao salvar")
+}
+
+// TestRateLimiterUseCase_BlockExpiration testa se o bloqueio expira corretamente.
+func TestRateLimiterUseCase_BlockExpiration(t *testing.T) {
+	tests := []struct {
+		name          string
+		identifier    string
+		isToken       bool
+		blockDuration int
+		waitTime      time.Duration
+		expectedAfter bool
+	}{
+		{
+			name:          "IP block expira",
+			identifier:    "192.168.1.1",
+			isToken:       false,
+			blockDuration: 1,
+			waitTime:      time.Second * 2,
+			expectedAfter: true,
+		},
+		{
+			name:          "Token block expira",
+			identifier:    "test-token",
+			isToken:       true,
+			blockDuration: 1,
+			waitTime:      time.Second * 2,
+			expectedAfter: true,
+		},
+		{
+			name:          "IP block não expira",
+			identifier:    "192.168.1.1",
+			isToken:       false,
+			blockDuration: 3,
+			waitTime:      time.Second * 2,
+			expectedAfter: false,
+		},
+		{
+			name:          "Token block não expira",
+			identifier:    "test-token",
+			isToken:       true,
+			blockDuration: 3,
+			waitTime:      time.Second * 2,
+			expectedAfter: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := NewMockRateLimiterRepository()
+			useCase := NewRateLimiterUseCase(
+				repo,
+				10,
+				100,
+				tt.blockDuration,
+				tt.blockDuration,
+				true,
+				true,
+			)
+
+			// Criar um limitador bloqueado
+			limiter := &entity.RateLimiter{
+				IP:           tt.identifier,
+				Token:        "",
+				Requests:     10,
+				LastRequest:  time.Now(),
+				Blocked:      true,
+				BlockedUntil: time.Now().Add(time.Duration(tt.blockDuration) * time.Second),
+			}
+
 			if tt.isToken {
+				limiter.IP = ""
 				limiter.Token = tt.identifier
 			}
-			limiter.Requests = tt.requests
-			limiter.LastRequest = time.Now()
-			repo.Save(context.Background(), limiter)
 
-			// Test
+			// Salvar o limitador
+			err := repo.Save(context.Background(), limiter)
+			require.NoError(t, err)
+
+			// Verificar se está bloqueado
 			allowed, err := useCase.IsAllowed(context.Background(), tt.identifier, tt.isToken)
-			if err != nil {
-				t.Errorf("Unexpected error: %v", err)
-			}
+			require.NoError(t, err)
+			assert.False(t, allowed)
 
-			if allowed != tt.expected {
-				t.Errorf("Expected IsAllowed() to be %v, got %v", tt.expected, allowed)
-			}
+			// Esperar o tempo de bloqueio
+			time.Sleep(tt.waitTime)
 
-			// Verify state after request
-			updatedLimiter, _ := repo.Get(context.Background(), tt.identifier)
-			if updatedLimiter != nil {
-				if tt.expected && updatedLimiter.Blocked {
-					t.Error("Expected limiter to not be blocked")
-				}
-				if !tt.expected && !updatedLimiter.Blocked {
-					t.Error("Expected limiter to be blocked")
-				}
+			// Verificar se o bloqueio expirou
+			allowed, err = useCase.IsAllowed(context.Background(), tt.identifier, tt.isToken)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedAfter, allowed)
+
+			// Verificar o estado do limitador
+			got, err := repo.Get(context.Background(), "rate_limit:"+tt.identifier)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+
+			if tt.expectedAfter {
+				assert.False(t, got.Blocked)
+				assert.True(t, got.BlockedUntil.IsZero())
+				assert.Equal(t, int64(1), got.Requests)
+			} else {
+				assert.True(t, got.Blocked)
+				assert.True(t, got.BlockedUntil.After(time.Now()))
 			}
 		})
 	}
 }
 
-func TestRateLimiterUseCase_BlockDuration(t *testing.T) {
-	repo := NewMockRepository()
-	blockDuration := 1 // 1 second
-	useCase := NewRateLimiterUseCase(repo, 10, 100, blockDuration)
+func TestRateLimiterUseCase_ConcurrentRequests(t *testing.T) {
+	repo := NewMockRateLimiterRepository()
+	useCase := NewRateLimiterUseCase(
+		repo,
+		10,
+		100,
+		300,
+		600,
+		true,
+		true,
+	)
 
-	// Test blocking
-	allowed, err := useCase.IsAllowed(context.Background(), "192.168.1.1", false)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-	if !allowed {
-		t.Error("Expected first request to be allowed")
-	}
+	// Teste concorrente para IP
+	t.Run("Concurrent IP requests", func(t *testing.T) {
+		var wg sync.WaitGroup
+		ip := "192.168.1.1"
+		requests := 20
+		successCount := 0
+		var mu sync.Mutex
 
-	// Make requests to exceed limit
-	for i := 0; i < 10; i++ {
-		useCase.IsAllowed(context.Background(), "192.168.1.1", false)
-	}
+		for i := 0; i < requests; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				allowed, err := useCase.IsAllowed(context.Background(), ip, false)
+				require.NoError(t, err)
+				if allowed {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+				}
+			}()
+		}
 
-	// Should be blocked
-	allowed, err = useCase.IsAllowed(context.Background(), "192.168.1.1", false)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-	if allowed {
-		t.Error("Expected to be blocked after exceeding limit")
-	}
+		wg.Wait()
+		assert.LessOrEqual(t, successCount, 10, "Número de requisições bem-sucedidas deve ser menor ou igual ao limite")
+	})
 
-	// Verify blocked state
-	limiter, _ := repo.Get(context.Background(), "192.168.1.1")
-	if limiter != nil && !limiter.Blocked {
-		t.Error("Expected limiter to be blocked")
-	}
+	// Teste concorrente para Token
+	t.Run("Concurrent Token requests", func(t *testing.T) {
+		var wg sync.WaitGroup
+		token := "test-token"
+		requests := 120
+		successCount := 0
+		var mu sync.Mutex
 
-	// Wait for block duration
-	time.Sleep(time.Duration(blockDuration+1) * time.Second)
+		for i := 0; i < requests; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				allowed, err := useCase.IsAllowed(context.Background(), token, true)
+				require.NoError(t, err)
+				if allowed {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+				}
+			}()
+		}
 
-	// Should be allowed again
-	allowed, err = useCase.IsAllowed(context.Background(), "192.168.1.1", false)
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-	if !allowed {
-		t.Error("Expected to be allowed again after block duration")
-	}
+		wg.Wait()
+		assert.LessOrEqual(t, successCount, 100, "Número de requisições bem-sucedidas deve ser menor ou igual ao limite")
+	})
+}
 
-	// Verify unblocked state
-	limiter, _ = repo.Get(context.Background(), "192.168.1.1")
-	if limiter != nil && limiter.Blocked {
-		t.Error("Expected limiter to be unblocked")
-	}
+func TestRateLimiterUseCase_RepositoryErrors(t *testing.T) {
+	repo := NewMockRateLimiterRepository()
+	useCase := NewRateLimiterUseCase(
+		repo,
+		10,
+		100,
+		300,
+		600,
+		true,
+		true,
+	)
+
+	t.Run("Get error", func(t *testing.T) {
+		repo.SetError(errors.New("erro simulado do repositório"))
+		allowed, err := useCase.IsAllowed(context.Background(), "test", false)
+		assert.Error(t, err)
+		assert.False(t, allowed)
+		assert.Contains(t, err.Error(), "erro simulado do repositório")
+	})
+
+	t.Run("Save error", func(t *testing.T) {
+		repo.SetError(nil) // Limpa o erro anterior
+		allowed, err := useCase.IsAllowed(context.Background(), "test", false)
+		require.NoError(t, err)
+		assert.True(t, allowed)
+
+		repo.SetError(errors.New("erro simulado ao salvar"))
+		allowed, err = useCase.IsAllowed(context.Background(), "test", false)
+		assert.Error(t, err)
+		assert.False(t, allowed)
+		assert.Contains(t, err.Error(), "erro simulado ao salvar")
+	})
 }

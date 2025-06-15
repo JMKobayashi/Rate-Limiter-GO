@@ -9,5 +9,23 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
 
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - REDIS_DB=0
+      - RATE_LIMIT_IP=10
+      - RATE_LIMIT_TOKEN=100
+      - BLOCK_DURATION_IP=300
+      - BLOCK_DURATION_TOKEN=600
+      - ENABLE_IP_LIMITER=true
+      - ENABLE_TOKEN_LIMITER=true
+    depends_on:
+      - redis
+
 volumes:
   redis_data: 
